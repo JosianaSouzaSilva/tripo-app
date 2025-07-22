@@ -1,0 +1,13 @@
+timm
+kornia
+ninja
+boto3
+Pillow
+spandrel==0.4.1
+cvcuda_cu12
+gltflib
+wget
+xatlas==0.0.11
+# Wheels customizados
+# https://huggingface.co/spaces/VAST-AI/MV-Adapter-Img2Texture/resolve/main/wheels/nvdiffrast-0.3.3-cp310-cp310-linux_x86_64.whl?download=true
+# https://huggingface.co/spaces/VAST-AI/TripoSG/resolve/main/diso-0.1.4-cp310-cp310-linux_x86_64.whl?download=true

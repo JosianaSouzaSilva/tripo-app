@@ -1,0 +1,15 @@
+torchvision==0.20.1
+diffusers
+transformers==4.49.0
+einops
+opencv-python
+trimesh==4.5.3
+omegaconf
+scikit-image
+numpy
+peft
+scipy==1.11.4
+jaxtyping
+typeguard
+pymeshlab==2022.2.post4
+open3d
