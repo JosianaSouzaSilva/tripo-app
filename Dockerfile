@@ -2,8 +2,8 @@ FROM nvidia/cuda:11.8.0-runtime-ubuntu22.04
 # FROM nvidia/cuda:11.8.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-
 ENV HOME=/app
+
 WORKDIR $HOME
 
 # Instala dependências básicas e Python

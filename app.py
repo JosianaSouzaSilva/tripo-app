@@ -7,10 +7,17 @@ import numpy as np
 from PIL import Image
 import trimesh
 import shutil
-from huggingface_hub import hf_hub_download, snapshot_download
-import subprocess
 import xatlas
 from setup_pipeline import TRIPOSG_CODE_DIR, MV_ADAPTER_CODE_DIR
+import logging
+from dotenv import load_dotenv
+
+# Carrega variáveis de ambiente do arquivo .env
+load_dotenv()
+
+# Configura o logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Adiciona os repositórios clonados ao sys.path
 sys.path.append(TRIPOSG_CODE_DIR)
@@ -30,18 +37,11 @@ from torchvision import transforms
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[DEVICE] Usando dispositivo: {DEVICE}")
 if DEVICE != "cuda":
-    raise RuntimeError("CUDA não está disponível. Verifique se o PyTorch está instalado corretamente com suporte a CUDA.")
+    logging.warning("Atenção: O dispositivo não é CUDA. Algumas operações podem ser mais lentas.")
 
 DTYPE = torch.float16
 NUM_VIEWS = 6
 DEFAULT_FACE_NUMBER = 10000
-TMP_DIR = "/tmp/ec2_tripo_job"
-
-if os.path.exists(TMP_DIR):
-    print(f"[DIR] Limpando o diretório temporário: {TMP_DIR}")
-    shutil.rmtree(TMP_DIR, ignore_errors=True)
-
-os.makedirs(TMP_DIR, exist_ok=True)
 
 INPUT_BUCKET = os.environ["INPUT_BUCKET"]
 OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
@@ -73,10 +73,11 @@ def upload_to_s3(local_path, bucket, key):
     print(f"[S3] Upload: {local_path} -> s3://{bucket}/{key}")
     try:
         s3.upload_file(local_path, bucket, key)
+        print("[S3] Upload concluído com sucesso")
         return f"https://{bucket}.s3.amazonaws.com/{key}"
     except botocore.exceptions.BotoCoreError as e:
+        print("[S3] Erro no upload")
         raise RuntimeError(f"Erro ao fazer upload de {local_path} para o bucket {bucket}: {e}")
-    print("[S3] Upload concluído com sucesso")
 
 def ensure_uv_mapping(mesh_path):
     """
@@ -120,6 +121,14 @@ def ensure_uv_mapping(mesh_path):
 
 def main(job_id, image_name="input.png", *args, **kwargs):
     seg_url = mesh_url = textured_url = mv_url = None
+
+    TMP_DIR = f"/tmp/{job_id}/"
+
+    if os.path.exists(TMP_DIR):
+        print(f"[DIR] Limpando o diretório temporário: {TMP_DIR}")
+        shutil.rmtree(TMP_DIR, ignore_errors=True)
+
+    os.makedirs(TMP_DIR, exist_ok=True)
 
     try:
         print(f"\n=== Iniciando Job {job_id} ===")
@@ -379,11 +388,14 @@ def main(job_id, image_name="input.png", *args, **kwargs):
             print(f"[ERRO][SALVAR RESULTADO] {type(e).__name__}: {e}")
 
         print("Processamento finalizado com sucesso!")
-        shutil.rmtree(TMP_DIR, ignore_errors=True)
 
     except Exception as e:
         print(f"[ERRO][PIPELINE] {type(e).__name__}: {e}")
         sys.exit(1)
+    finally:
+        if os.path.exists(TMP_DIR):
+            print(f"[DIR] Limpando o diretório temporário: {TMP_DIR}")
+            shutil.rmtree(TMP_DIR, ignore_errors=True)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
