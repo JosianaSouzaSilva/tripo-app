@@ -19,6 +19,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# Configuração para Windows
+TMP_BASE_DIR = os.environ.get('TEMP', 'C:\\temp') if os.name == 'nt' else '/tmp'
+
 # Adiciona os repositórios clonados ao sys.path
 sys.path.append(TRIPOSG_CODE_DIR)
 sys.path.append(os.path.join(TRIPOSG_CODE_DIR, "scripts"))
@@ -35,55 +38,76 @@ from transformers import AutoModelForImageSegmentation
 from torchvision import transforms
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-print(f"[DEVICE] Usando dispositivo: {DEVICE}")
+logger.info(f"Usando dispositivo: {DEVICE}")
 if DEVICE != "cuda":
-    logging.warning("Atenção: O dispositivo não é CUDA. Algumas operações podem ser mais lentas.")
+    logger.warning("Atenção: O dispositivo não é CUDA. Algumas operações podem ser mais lentas.")
 
 DTYPE = torch.float16
 NUM_VIEWS = 6
 DEFAULT_FACE_NUMBER = 10000
 
-INPUT_BUCKET = os.environ["INPUT_BUCKET"]
-OUTPUT_BUCKET = os.environ["OUTPUT_BUCKET"]
+INPUT_BUCKET = os.environ.get("INPUT_BUCKET")
+OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET")
 if not INPUT_BUCKET or not OUTPUT_BUCKET:
     raise ValueError("As variáveis de ambiente INPUT_BUCKET e OUTPUT_BUCKET devem ser definidas.")
 
-s3 = boto3.client("s3")
+# Cliente S3 com configuração de timeout
+s3 = boto3.client(
+    "s3",
+    config=boto3.session.Config(
+        retries={'max_attempts': 3, 'mode': 'adaptive'},
+        read_timeout=300,
+        connect_timeout=60
+    )
+)
 
 def get_random_hex():
     return os.urandom(8).hex()
 
 def generate_temp_filename(filename: str) -> str:
+    """Gera um nome de arquivo temporário único."""
     name, ext = os.path.splitext(filename)
     temp_name = f"{name}_{get_random_hex()}{ext}"
-    print(f"[generate_temp_filename] Base: {filename} -> Temp: {temp_name}")
+    logger.debug(f"Base: {filename} -> Temp: {temp_name}")
     return temp_name
     
 def download_from_s3(bucket, key, local_path):
-    print(f"[S3] Download: s3://{bucket}/{key} -> {local_path}")
+    """Baixa arquivo do S3 com tratamento de erro adequado."""
+    logger.info(f"Download: s3://{bucket}/{key} -> {local_path}")
     try:
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
         s3.download_file(bucket, key, local_path)
     except botocore.exceptions.BotoCoreError as e:
         raise RuntimeError(f"Erro ao baixar {key} do bucket {bucket}: {e}")
+    except Exception as e:
+        raise RuntimeError(f"Erro inesperado ao baixar {key}: {e}")
+    
     if not os.path.isfile(local_path):
         raise FileNotFoundError(f"Download de {key} concluído, mas o arquivo não foi encontrado em {local_path}")
-    print("[S3] Download concluído com sucesso")
+    logger.info("Download concluído com sucesso")
 
 def upload_to_s3(local_path, bucket, key):
-    print(f"[S3] Upload: {local_path} -> s3://{bucket}/{key}")
+    """Faz upload de arquivo para S3 com tratamento de erro adequado."""
+    logger.info(f"Upload: {local_path} -> s3://{bucket}/{key}")
     try:
         s3.upload_file(local_path, bucket, key)
-        print("[S3] Upload concluído com sucesso")
+        logger.info("Upload concluído com sucesso")
         return f"https://{bucket}.s3.amazonaws.com/{key}"
     except botocore.exceptions.BotoCoreError as e:
-        print("[S3] Erro no upload")
+        logger.error("Erro no upload")
         raise RuntimeError(f"Erro ao fazer upload de {local_path} para o bucket {bucket}: {e}")
 
 def ensure_uv_mapping(mesh_path):
     """
-    Garante que o mesh tenha UV. Se não tiver, faz o unwrap com xatlas e salva novamente.
+    Garante que o mesh tenha UV mapping. Se não tiver, aplica unwrap com xatlas.
+    
+    Args:
+        mesh_path (str): Caminho para o arquivo do mesh
+        
+    Raises:
+        Exception: Se houver erro no processamento UV
     """
-    print("[UV] Verificando UV no mesh...")
+    logger.info("Verificando UV mapping no mesh...")
     mesh = trimesh.load(mesh_path)
     mesh_uv = None
     if isinstance(mesh, trimesh.Scene):
@@ -93,10 +117,10 @@ def ensure_uv_mapping(mesh_path):
         mesh_uv = mesh
 
     if mesh_uv is not None and hasattr(mesh_uv.visual, "uv") and mesh_uv.visual.uv is not None:
-        print("[UV] Mesh já tem UV.")
+        logger.info("Mesh já possui UV mapping")
         return
 
-    print("[UV] Mesh NÃO tem UV. Aplicando unwrap com xatlas...")
+    logger.info("Mesh não possui UV mapping. Aplicando unwrap com xatlas...")
     try:
         v = mesh_uv.vertices.astype(np.float32)
         f = mesh_uv.faces.astype(np.uint32)
@@ -114,30 +138,56 @@ def ensure_uv_mapping(mesh_path):
         mesh_uv.visual = trimesh.visual.TextureVisuals(uv=uvs)
         
         mesh_uv.export(mesh_path)
-        print("[UV] UV mapping gerado e mesh salvo!")
+        logger.info("UV mapping aplicado e mesh salvo com sucesso")
     except Exception as e:
-        print(f"[UV][ERRO] Falha ao aplicar UV mapping: {type(e).__name__}: {e}")
+        logger.error(f"Falha ao aplicar UV mapping: {type(e).__name__}: {e}")
         raise
 
 def main(job_id, image_name="input.png", *args, **kwargs):
+    """
+    Função principal para processamento de imagem 2D para modelo 3D texturizado.
+    
+    Args:
+        job_id (str): ID único do job
+        image_name (str): Nome do arquivo de imagem de entrada
+        **kwargs: Parâmetros opcionais do pipeline
+        
+    Returns:
+        dict: URLs dos arquivos gerados (segmentation, model, textured, views)
+        
+    Raises:
+        Exception: Se houver erro em qualquer etapa do pipeline
+    """
     seg_url = mesh_url = textured_url = mv_url = None
 
-    TMP_DIR = f"/tmp/{job_id}/"
+    # Validação e conversão de parâmetros
+    num_views = int(kwargs.get("num_views", NUM_VIEWS))
+    seed = int(kwargs.get("seed", 0))
+    num_inference_steps = int(kwargs.get("num_inference_steps", 50))
+    guidance_scale = float(kwargs.get("guidance_scale", 7.5))
+    simplify = kwargs.get("simplify", True)
+    if isinstance(simplify, str):
+        simplify = simplify.lower() == "true"
+    target_face_num = int(kwargs.get("target_face_num", DEFAULT_FACE_NUMBER))
+    text_prompt = kwargs.get("text_prompt", "high quality")
+
+    # Usar diretório temporário apropriado para o SO
+    TMP_DIR = os.path.join(TMP_BASE_DIR, job_id)
 
     if os.path.exists(TMP_DIR):
-        print(f"[DIR] Limpando o diretório temporário: {TMP_DIR}")
+        logger.info(f"Limpando diretório temporário: {TMP_DIR}")
         shutil.rmtree(TMP_DIR, ignore_errors=True)
 
     os.makedirs(TMP_DIR, exist_ok=True)
 
     try:
-        print(f"\n=== Iniciando Job {job_id} ===")
+        logger.info(f"=== Iniciando Job {job_id} ===")
         input_prefix = output_prefix = f"{job_id}/"
         input_img_key = input_prefix + image_name
         local_input_img = os.path.join(TMP_DIR, image_name)
         download_from_s3(INPUT_BUCKET, input_img_key, local_input_img)
 
-        print("[MODEL] Carregando RMBG e pipelines...")
+        logger.info("Carregando modelos e pipelines...")
         try:
             rmbg_net = BriaRMBG.from_pretrained("checkpoints/RMBG-1.4").to(DEVICE).eval()
             triposg_pipe = TripoSGPipeline.from_pretrained("checkpoints/TripoSG").to(DEVICE, DTYPE)
@@ -148,18 +198,18 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                 lora_model=None,
                 adapter_path="huanngzh/mv-adapter",
                 scheduler=None,
-                num_views=NUM_VIEWS,
+                num_views=num_views,
                 device=DEVICE,
                 dtype=torch.float16
             )
         except Exception as e:
-            print(f"[ERRO][MODEL] Falha ao carregar pipelines/modelos: {type(e).__name__}: {e}")
+            logger.error(f"Falha ao carregar modelos: {type(e).__name__}: {e}")
             raise
 
         try:
             birefnet = AutoModelForImageSegmentation.from_pretrained("ZhengPeng7/BiRefNet", trust_remote_code=True).to(DEVICE)
         except Exception as e:
-            print(f"[ERRO][MODEL] Falha ao carregar BiRefNet: {type(e).__name__}: {e}")
+            logger.error(f"Falha ao carregar BiRefNet: {type(e).__name__}: {e}")
             raise
 
         transform_image = transforms.Compose([
@@ -181,17 +231,11 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                         img = img[:, :, :3]
                 return remove_bg(img, birefnet, transform_image, DEVICE)
             except Exception as e:
-                print(f"[ERRO][REMOVE_BG] {type(e).__name__}: {e}")
+                logger.error(f"Erro na remoção de background: {type(e).__name__}: {e}")
                 raise
 
-        seed = 0
-        num_inference_steps = 50
-        guidance_scale = 7.5
-        simplify = True
-        target_face_num = DEFAULT_FACE_NUMBER
-        text_prompt = "high quality"
 
-        print("[STEP] Segmentação...")
+        logger.info("Iniciando etapa de segmentação...")
         try:
             image_seg = prepare_image(local_input_img, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=rmbg_net)
             seg_path = os.path.join(TMP_DIR, generate_temp_filename("segmentation.png"))
@@ -199,13 +243,13 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                 Image.fromarray((image_seg * 255).astype(np.uint8)).save(seg_path)
             else:
                 image_seg.save(seg_path)
-            print(f"[STEP] Segmentação salva em {seg_path}")
+            logger.info(f"Segmentação salva em {seg_path}")
             seg_url = upload_to_s3(seg_path, OUTPUT_BUCKET, output_prefix + "segmentation.png")
         except Exception as e:
-            print(f"[ERRO][SEGMENTAÇÃO] {type(e).__name__}: {e}")
+            logger.error(f"Falha na segmentação: {type(e).__name__}: {e}")
             raise
 
-        print("[STEP] Reconstrução Mesh 3D...")
+        logger.info("Iniciando reconstrução de mesh 3D...")
         try:
             outputs = triposg_pipe(
                 image=image_seg,
@@ -215,14 +259,14 @@ def main(job_id, image_name="input.png", *args, **kwargs):
             ).samples[0]
             mesh = trimesh.Trimesh(outputs[0].astype(np.float32), np.ascontiguousarray(outputs[1]))
             if simplify:
-                print("[STEP] Simplificando mesh...")
+                logger.info("Simplificando mesh...")
                 from utils import simplify_mesh
                 mesh = simplify_mesh(mesh, target_face_num)
             mesh_path = os.path.join(TMP_DIR, generate_temp_filename("triposg.glb"))
             mesh.export(mesh_path)
-            print(f"[STEP] Mesh exportado para {mesh_path}")
+            logger.info(f"Mesh exportado para {mesh_path}")
         except Exception as e:
-            print(f"[ERRO][RECONSTRUÇÃO MESH] {type(e).__name__}: {e}")
+            logger.error(f"Falha na reconstrução do mesh: {type(e).__name__}: {e}")
             raise
 
         ensure_uv_mapping(mesh_path)
@@ -387,20 +431,120 @@ def main(job_id, image_name="input.png", *args, **kwargs):
         except Exception as e:
             print(f"[ERRO][SALVAR RESULTADO] {type(e).__name__}: {e}")
 
-        print("Processamento finalizado com sucesso!")
+        logger.info("Processamento finalizado com sucesso!")
+        return result
 
     except Exception as e:
-        print(f"[ERRO][PIPELINE] {type(e).__name__}: {e}")
-        sys.exit(1)
+        logger.error(f"Erro no pipeline: {type(e).__name__}: {e}")
+        raise  # Re-lança a exceção para que o Flask possa tratá-la adequadamente
     finally:
         if os.path.exists(TMP_DIR):
-            print(f"[DIR] Limpando o diretório temporário: {TMP_DIR}")
+            logger.info(f"Limpando diretório temporário: {TMP_DIR}")
             shutil.rmtree(TMP_DIR, ignore_errors=True)
 
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+@app.route("/health", methods=["GET"])
+def health_check():
+    """Endpoint de verificação de saúde da aplicação."""
+    return jsonify({
+        "status": "healthy",
+        "device": DEVICE,
+        "input_bucket": INPUT_BUCKET,
+        "output_bucket": OUTPUT_BUCKET
+    }), 200
+
+@app.route("/process", methods=["POST"])
+def process():
+    """Endpoint para processamento de imagem 2D para modelo 3D."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "JSON payload é obrigatório"}), 400
+
+        # Validação de parâmetros obrigatórios
+        job_id = data.get("job_id")
+        if not job_id:
+            return jsonify({"error": "Parâmetro 'job_id' é obrigatório"}), 400
+        
+        # Validação básica do job_id
+        if not isinstance(job_id, str) or len(job_id.strip()) == 0:
+            return jsonify({"error": "job_id deve ser uma string não vazia"}), 400
+
+        # Parâmetros opcionais com validação
+        image_name = data.get("image_name", "input.png")
+        
+        try:
+            num_views = int(data.get("num_views", 6))
+            if num_views <= 0:
+                return jsonify({"error": "num_views deve ser maior que 0"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "num_views deve ser um número inteiro"}), 400
+            
+        try:
+            seed = int(data.get("seed", 0))
+        except (ValueError, TypeError):
+            return jsonify({"error": "seed deve ser um número inteiro"}), 400
+            
+        try:
+            num_inference_steps = int(data.get("num_inference_steps", 50))
+            if num_inference_steps <= 0:
+                return jsonify({"error": "num_inference_steps deve ser maior que 0"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "num_inference_steps deve ser um número inteiro"}), 400
+            
+        try:
+            guidance_scale = float(data.get("guidance_scale", 7.5))
+            if guidance_scale <= 0:
+                return jsonify({"error": "guidance_scale deve ser maior que 0"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "guidance_scale deve ser um número"}), 400
+            
+        simplify = data.get("simplify", True)
+        if isinstance(simplify, str):
+            simplify = simplify.lower() in ("true", "1", "yes")
+        elif not isinstance(simplify, bool):
+            return jsonify({"error": "simplify deve ser um boolean ou string"}), 400
+            
+        try:
+            target_face_num = int(data.get("target_face_num", 10000))
+            if target_face_num <= 0:
+                return jsonify({"error": "target_face_num deve ser maior que 0"}), 400
+        except (ValueError, TypeError):
+            return jsonify({"error": "target_face_num deve ser um número inteiro"}), 400
+            
+        text_prompt = data.get("text_prompt", "high quality")
+        if not isinstance(text_prompt, str):
+            return jsonify({"error": "text_prompt deve ser uma string"}), 400
+
+        logger.info(f"Iniciando processamento para job_id: {job_id}")
+        
+    except Exception as e:
+        logger.error(f"Erro na validação dos parâmetros: {str(e)}")
+        return jsonify({"error": "Erro na validação dos parâmetros"}), 400
+
+    # Chamada do pipeline com os argumentos
+    try:
+        result = main(
+            job_id=job_id,
+            image_name=image_name,
+            num_views=num_views,
+            seed=seed,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+            simplify=simplify,
+            target_face_num=target_face_num,
+            text_prompt=text_prompt
+        )
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Erro no processamento do job {job_id}: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python app.py <job_id> [image_name]")
-        sys.exit(1)
-    job_id = sys.argv[1]
-    image_name = sys.argv[2] if len(sys.argv) > 2 else "input.png"
-    main(job_id, image_name)
+    logger.info("Iniciando servidor Flask...")
+    logger.info(f"PyTorch version: {torch.__version__}")
+    logger.info(f"CUDA available: {torch.cuda.is_available()}")
+    app.run(host="0.0.0.0", port=8000, debug=True)

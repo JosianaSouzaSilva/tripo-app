@@ -26,10 +26,10 @@ RUN useradd -m user && \
 
 USER user
 
-# Copia arquivos -
+# Copia todos os arquivos necessários
 COPY --chown=user:user . $HOME
 
-# Instala as dependências do TripoSG e MV-Adapter
+# ----- Instala o pipeline do TripoSG -----
 COPY --chown=user:user nvdiffrast-0.3.3-cp310-cp310-linux_x86_64.whl .
 COPY --chown=user:user diso-0.1.4-cp310-cp310-linux_x86_64.whl .
 
@@ -39,34 +39,10 @@ RUN pip install --no-cache-dir \
     
 COPY --chown=user:user texture.cpython-310-x86_64-linux-gnu.so /app/texture.cpython-310-x86_64-linux-gnu.so
 
-# ------ Bibliotecas -----
-# RUN git clone https://github.com/VAST-AI-Research/TripoSG.git $HOME/tripoSG
-# ENV PYTHONPATH="${PYTHONPATH}:$HOME/tripoSG"
-
-# RUN git clone https://github.com/huanngzh/MV-Adapter.git $HOME/mv_adapter && \
-#     cd $HOME/mv_adapter && \
-#     git checkout 7d37a97e9bc223cdb8fd26a76bd8dd46504c7c3d
-# ENV PYTHONPATH="${PYTHONPATH}:$HOME/mv_adapter"
-
-# ------- Modelos do Hugging Face ------
-# Install huggingface_hub
-RUN pip install huggingface_hub
-    
-# Download RealESRGAN_x2plus.pth from HuggingFace
-#RUN python -c \"from huggingface_hub import hf_hub_download; hf_hub_download('dtarnow/UPscaler', filename='RealESRGAN_x2plus.pth', local_dir='checkpoints')\"
-
-# Download big-lama.pt using wget
-#RUN wget -P checkpoints/ https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt
-
-# Download RMBG-1.4 and TripoSG snapshots from HuggingFace
-#RUN python -c \"from huggingface_hub import snapshot_download; snapshot_download('briaai/RMBG-1.4', local_dir='checkpoints/RMBG-1.4')\"
-#RUN python -c \"from huggingface_hub import snapshot_download; snapshot_download('VAST-AI/TripoSG', local_dir='checkpoints/TripoSG')\"
-
-# Verifica a instação das bibliotecas e modelos
+RUN pip install huggingface_hub 
 RUN python setup_pipeline.py
 
 # ------ Instala o restante das libs -----
-# RUN pip install --no-cache-dir -r requirements.txt
 ENV TMPDIR=/app/tmp
 RUN mkdir -p /app/tmp
 
@@ -77,6 +53,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --trusted-host download.pytorch.org \
 --index-url http://download.pytorch.org/whl/cu118 \
 torch torchvision torchaudio
+
+# Garante que o app.py é o mais recente
+COPY --chown=user:user app.py $HOME/app.py
 
 EXPOSE 8000
 

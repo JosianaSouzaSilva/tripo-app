@@ -1,0 +1,7 @@
+FROM ${ACCOUT_ID}.dkr.ecr.us-east-1.amazonaws.com/tripo-nestle-3d:2.0
+
+USER user
+
+COPY --chown=user:user *.py $HOME/
+
+CMD ["python", "app.py"]
