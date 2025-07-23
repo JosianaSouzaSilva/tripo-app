@@ -8,8 +8,8 @@ CMD ["python", "app.py"]
 
 # -- Como utilizar este Dockerfile --
 # para buildar passando variavel pro docker build
-# docker build --build-arg ACCOUNT=123456789012 -t tripo-nestle-3d:latest -f Dockerfile.latest .
+# docker build --build-arg ACCOUNT_ID=123456789012 -t tripo-nestle-3d:latest -f Dockerfile.latest .
 
 # para rodar o container
-# docker run -d --gpus all --runtime=nvidia -p 8000:8000 -e INPUT_BUCKET=nestle-3d-inputs -e OUTPUT_BUCKET=nestle-3d-outputs --name tripo-nestle-3d tripo-nestle-3d:latest
+# docker run -d --gpus all --runtime=nvidia -p 80:8000 -e INPUT_BUCKET=nestle-3d-inputs -e OUTPUT_BUCKET=nestle-3d-outputs --name tripo-nestle-3d tripo-nestle-3d:latest
 # docker exec -it tripo-nestle-3d bash
