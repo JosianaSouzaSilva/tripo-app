@@ -48,8 +48,11 @@ DEFAULT_FACE_NUMBER = 10000
 
 INPUT_BUCKET = os.environ.get("INPUT_BUCKET")
 OUTPUT_BUCKET = os.environ.get("OUTPUT_BUCKET")
+DYNAMODB_TABLE = os.environ.get("DYNAMODB_TABLE", "Nestle3DJobs")
 if not INPUT_BUCKET or not OUTPUT_BUCKET:
     raise ValueError("As variáveis de ambiente INPUT_BUCKET e OUTPUT_BUCKET devem ser definidas.")
+# if not DYNAMODB_TABLE:
+#     raise ValueError("A variável de ambiente DYNAMODB_TABLE deve ser definida.")
 
 # Cliente S3 com configuração de timeout
 s3 = boto3.client(
@@ -58,6 +61,22 @@ s3 = boto3.client(
         retries={'max_attempts': 3, 'mode': 'adaptive'},
         read_timeout=300,
         connect_timeout=60
+    )
+)
+
+# Cliente DynamoDB
+dynamodb = boto3.resource(
+    "dynamodb",
+    region_name="us-east-2",
+    config=boto3.session.Config(
+        retries={
+            'max_attempts': 3, 
+            'mode': 'adaptive',
+            'total_max_attempts': 5
+        },
+        read_timeout=300,
+        connect_timeout=60,
+        max_pool_connections=50
     )
 )
 
@@ -96,6 +115,87 @@ def upload_to_s3(local_path, bucket, key):
     except botocore.exceptions.BotoCoreError as e:
         logger.error("Erro no upload")
         raise RuntimeError(f"Erro ao fazer upload de {local_path} para o bucket {bucket}: {e}")
+    except Exception as e:
+        logger.error("Erro inesperado no upload")
+        raise RuntimeError(f"Erro inesperado ao fazer upload de {local_path}: {e}")
+
+def update_job_status(job_id, status, additional_data=None):
+    """
+    Atualiza o status de um job no DynamoDB.
+    
+    Args:
+        job_id (str): ID único do job
+        status (str): Status atual do job (started, processing, completed, failed, etc.)
+        additional_data (dict, optional): Dados adicionais para atualizar
+    """
+    import datetime
+    
+    logger.info(f"Atualizando status do job {job_id} para: {status}")
+    
+    try:
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        
+        # Timestamp atual
+        timestamp = datetime.datetime.utcnow().isoformat() + "Z"
+        
+        # Monta a expressão de atualização
+        update_expression = "SET #status = :status, #updated_at = :timestamp"
+        expression_attribute_names = {
+            "#status": "status",
+            "#updated_at": "updated_at"
+        }
+        expression_attribute_values = {
+            ":status": status,
+            ":timestamp": timestamp
+        }
+        
+        # Adiciona dados extras se fornecidos
+        if additional_data:
+            for key, value in additional_data.items():
+                attr_name = f"#{key}"
+                attr_value = f":{key}"
+                update_expression += f", {attr_name} = {attr_value}"
+                expression_attribute_names[attr_name] = key
+                expression_attribute_values[attr_value] = value
+        
+        response = table.update_item(
+            Key={"jobId": job_id},
+            UpdateExpression=update_expression,
+            ExpressionAttributeNames=expression_attribute_names,
+            ExpressionAttributeValues=expression_attribute_values,
+            ReturnValues="UPDATED_NEW"
+        )
+        
+        logger.info(f"Status do job {job_id} atualizado com sucesso para: {status}")
+        return response
+        
+    except botocore.exceptions.ClientError as e:
+        error_code = e.response['Error']['Code']
+        logger.error(f"Erro do cliente DynamoDB ({error_code}) ao atualizar job {job_id}: {e}")
+        # Não re-lança a exceção para não interromper o pipeline
+    except Exception as e:
+        logger.error(f"Erro inesperado ao atualizar status do job {job_id}: {type(e).__name__}: {e}")
+        # Não re-lança a exceção para não interromper o pipeline
+
+def update_dynamodb_item(table_name, key, update_expression, expression_attribute_values):
+    """Atualiza um item no DynamoDB"""
+    logger.info(f"Atualizando item na tabela {table_name} com chave {key}")
+    try:
+        table = dynamodb.Table(table_name)
+        response = table.update_item(
+            Key=key,
+            UpdateExpression=update_expression,
+            ExpressionAttributeValues=expression_attribute_values,
+            ReturnValues="UPDATED_NEW"
+        )
+        logger.info("Item atualizado com sucesso")
+        return response
+    except botocore.exceptions.BotoCoreError as e:
+        logger.error("Erro ao atualizar item no DynamoDB")
+        raise RuntimeError(f"Erro ao atualizar item: {e}")
+    except Exception as e:
+        logger.error("Erro inesperado ao atualizar item no DynamoDB")
+        raise RuntimeError(f"Erro inesperado ao atualizar item: {e}")
 
 def ensure_uv_mapping(mesh_path):
     """
@@ -182,12 +282,30 @@ def main(job_id, image_name="input.png", *args, **kwargs):
 
     try:
         logger.info(f"=== Iniciando Job {job_id} ===")
+        
+        # Atualiza status: iniciando
+        update_job_status(job_id, "started", {
+            "image_name": image_name,
+            "num_views": num_views,
+            "seed": seed,
+            "num_inference_steps": num_inference_steps,
+            "guidance_scale": guidance_scale,
+            "simplify": simplify,
+            "target_face_num": target_face_num,
+            "text_prompt": text_prompt
+        })
+        
         input_prefix = output_prefix = f"{job_id}/"
         input_img_key = input_prefix + image_name
         local_input_img = os.path.join(TMP_DIR, image_name)
+        
+        # Atualiza status: baixando imagem
+        # update_job_status(job_id, "downloading_image")
         download_from_s3(INPUT_BUCKET, input_img_key, local_input_img)
 
         logger.info("Carregando modelos e pipelines...")
+        # Atualiza status: carregando modelos
+        update_job_status(job_id, "loading_models")
         try:
             rmbg_net = BriaRMBG.from_pretrained("checkpoints/RMBG-1.4").to(DEVICE).eval()
             triposg_pipe = TripoSGPipeline.from_pretrained("checkpoints/TripoSG").to(DEVICE, DTYPE)
@@ -236,6 +354,8 @@ def main(job_id, image_name="input.png", *args, **kwargs):
 
 
         logger.info("Iniciando etapa de segmentação...")
+        # Atualiza status: processando segmentação
+        #update_job_status(job_id, "processing_segmentation")
         try:
             image_seg = prepare_image(local_input_img, bg_color=np.array([1.0, 1.0, 1.0]), rmbg_net=rmbg_net)
             seg_path = os.path.join(TMP_DIR, generate_temp_filename("segmentation.png"))
@@ -245,11 +365,17 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                 image_seg.save(seg_path)
             logger.info(f"Segmentação salva em {seg_path}")
             seg_url = upload_to_s3(seg_path, OUTPUT_BUCKET, output_prefix + "segmentation.png")
+            
+            # Atualiza status: segmentação concluída
+            update_job_status(job_id, "segmentation_completed", {"segmentation_url": seg_url})
         except Exception as e:
             logger.error(f"Falha na segmentação: {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Falha na segmentação: {str(e)}"})
             raise
 
         logger.info("Iniciando reconstrução de mesh 3D...")
+        # Atualiza status: gerando mesh 3D
+        # update_job_status(job_id, "generating_3d_mesh")
         try:
             outputs = triposg_pipe(
                 image=image_seg,
@@ -267,8 +393,11 @@ def main(job_id, image_name="input.png", *args, **kwargs):
             logger.info(f"Mesh exportado para {mesh_path}")
         except Exception as e:
             logger.error(f"Falha na reconstrução do mesh: {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Falha na reconstrução do mesh: {str(e)}"})
             raise
 
+        # Atualiza status: processando UV mapping
+        #update_job_status(job_id, "processing_uv_mapping")
         ensure_uv_mapping(mesh_path)
 
         print("[DEBUG] Verificando se o mesh tem UV:")
@@ -290,9 +419,13 @@ def main(job_id, image_name="input.png", *args, **kwargs):
 
         try:
             mesh_url = upload_to_s3(mesh_path, OUTPUT_BUCKET, output_prefix + "model.glb")
+            # Atualiza status: mesh 3D concluído
+            update_job_status(job_id, "mesh_3d_completed", {"mesh_url": mesh_url})
         except Exception as e:
             print(f"[ERRO][UPLOAD MESH] {type(e).__name__}: {e}")
 
+        # Atualiza status: preparando texturização
+        # update_job_status(job_id, "preparing_texturing")
         height, width = 768, 768
         cameras = get_orthogonal_camera(
             elevation_deg=[0, 0, 0, 0, 89.99, -89.99],
@@ -306,6 +439,8 @@ def main(job_id, image_name="input.png", *args, **kwargs):
 
         try:
             print("[STEP] Renderizando views...")
+            # Atualiza status: renderizando views
+            # update_job_status(job_id, "rendering_views")
             render_out = render(ctx, mesh_loaded, cameras, height=height, width=width, render_attr=False, normal_background=0.0)
             control_images = torch.cat([
                 (render_out.pos[..., :3] + 0.5).clamp(0, 1),
@@ -313,10 +448,13 @@ def main(job_id, image_name="input.png", *args, **kwargs):
             ], dim=-1).permute(0, 3, 1, 2).to(DEVICE)
         except Exception as e:
             print(f"[ERRO][RENDER] {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Erro na renderização: {str(e)}"})
             raise
 
         try:
             print("[STEP] Preprocessando imagem para referência (remoção de BG e RGB)...")
+            # Atualiza status: preprocessando imagem
+            # update_job_status(job_id, "preprocessing_image")
             image = Image.open(local_input_img)
             
             # Garante que a imagem seja RGB
@@ -352,10 +490,13 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                     image = image[:3, :, :]
         except Exception as e:
             print(f"[ERRO][PREPROCESS IMAGEM TEX] {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Erro no preprocessamento: {str(e)}"})
             raise
 
         try:
             print("[STEP] Gerando views MV-Adapter...")
+            # Atualiza status: gerando views
+            # update_job_status(job_id, "generating_views")
             images = mv_adapter_pipe(
                 text_prompt, height=height, width=width,
                 num_inference_steps=10, guidance_scale=3.0, num_images_per_prompt=NUM_VIEWS,
@@ -378,10 +519,13 @@ def main(job_id, image_name="input.png", *args, **kwargs):
             img.close()
         except Exception as e:
             print(f"[ERRO][MV-ADAPTER/TEX VIEWS] {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Erro na geração de views: {str(e)}"})
             raise
 
         try:
             print("[STEP] Gerando textura com TexturePipeline...")
+            # Atualiza status: aplicando textura
+            update_job_status(job_id, "applying_texture")
             from texture import TexturePipeline, ModProcessConfig
 
             texture_pipe = TexturePipeline(
@@ -417,9 +561,11 @@ def main(job_id, image_name="input.png", *args, **kwargs):
                 print(f"[ERRO][CHECK MESH TEX] {type(ex).__name__}: {ex}")
 
             textured_url = upload_to_s3(textured_glb_path, OUTPUT_BUCKET, output_prefix + "textured.glb")
+            update_job_status(job_id, "texture_completed", {"textured_url": textured_url}) 
             mv_url = upload_to_s3(mv_image_path, OUTPUT_BUCKET, output_prefix + "views.png")
         except Exception as e:
             print(f"[ERRO][TEXTURE PIPELINE] {type(e).__name__}: {e}")
+            update_job_status(job_id, "failed", {"error": f"Erro na texturização: {str(e)}"})
 
         result = {"segmentation": seg_url, "model": mesh_url, "textured": textured_url, "views": mv_url}
         result_path = os.path.join(TMP_DIR, "result.json")
@@ -431,11 +577,21 @@ def main(job_id, image_name="input.png", *args, **kwargs):
         except Exception as e:
             print(f"[ERRO][SALVAR RESULTADO] {type(e).__name__}: {e}")
 
+        # Atualiza status: processamento concluído com sucesso
+        update_job_status(job_id, "completed", {
+            "segmentation_url": seg_url,
+            "model_url": mesh_url,
+            "textured_url": textured_url,
+            "views_url": mv_url
+        })
+        
         logger.info("Processamento finalizado com sucesso!")
         return result
 
     except Exception as e:
         logger.error(f"Erro no pipeline: {type(e).__name__}: {e}")
+        # Atualiza status como falha se não foi atualizado anteriormente
+        update_job_status(job_id, "failed", {"error": f"Erro geral no pipeline: {str(e)}"})
         raise  # Re-lança a exceção para que o Flask possa tratá-la adequadamente
     finally:
         if os.path.exists(TMP_DIR):
@@ -453,7 +609,8 @@ def health_check():
         "status": "healthy",
         "device": DEVICE,
         "input_bucket": INPUT_BUCKET,
-        "output_bucket": OUTPUT_BUCKET
+        "output_bucket": OUTPUT_BUCKET,
+        "dynamodb_table": DYNAMODB_TABLE
     }), 200
 
 @app.route("/process", methods=["POST"])
